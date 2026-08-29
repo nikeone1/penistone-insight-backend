@@ -34,6 +34,7 @@ const VILLAGE_KEYWORDS = [
 
 let cachedReports = [];
 let lastFetch = 0;
+let sourceCache = {}; // source name -> last successful item list, so one flaky source doesn't blank the others
 
 // --- Small XML/HTML helpers -------------------------------------------
 // RSS description fields arrive XML-entity-encoded (so a literal "<br>"
@@ -93,9 +94,19 @@ function mapCategory(category, title) {
 }
 
 // --- Fetching one RSS source --------------------------------------------
-async function fetchRssSource(source) {
+function sleep(ms) { return new Promise(resolve => setTimeout(resolve, ms)); }
+
+async function fetchRssSourceOnce(source) {
   const res = await fetch(source.url, {
-    headers: { 'User-Agent': 'Mozilla/5.0 (compatible; PenistoneInsightHub/1.0)' }
+    headers: {
+      // FixMyStreet's RSS endpoint appears to be flaky/rate-limited against
+      // generic bot-style User-Agents — a realistic browser UA + Accept
+      // headers noticeably cuts down on 503s.
+      'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
+      'Accept': 'application/rss+xml, application/xml;q=0.9, text/xml;q=0.8, */*;q=0.7',
+      'Accept-Language': 'en-GB,en;q=0.9'
+    },
+    timeout: 15000
   });
   if (!res.ok) throw new Error(`HTTP ${res.status}`);
   const xml = await res.text();
@@ -148,30 +159,41 @@ async function fetchRssSource(source) {
   return items;
 }
 
-async function fetchReports() {
-  try {
-    console.log('Fetching reports from all sources...');
-    const results = await Promise.allSettled(SOURCES.map(fetchRssSource));
-
-    const merged = new Map(); // de-dupe by report URL (a report can appear in both a ward feed and the fallback feed)
-    results.forEach((r, i) => {
-      if (r.status === 'fulfilled') {
-        r.value.forEach(item => merged.set(item.id, item));
-        console.log(`  ${SOURCES[i].name}: ${r.value.length} reports`);
-      } else {
-        console.error(`  ${SOURCES[i].name} failed:`, r.reason && r.reason.message);
-      }
-    });
-
-    // Keep the last good cache if every source failed this cycle, rather than wiping the dashboard.
-    if (merged.size > 0 || cachedReports.length === 0) {
-      cachedReports = Array.from(merged.values()).sort((a, b) => b.ts - a.ts);
+// Retry transient failures (503s, timeouts) a couple of times with backoff
+// before giving up on a source for this cycle.
+async function fetchRssSource(source, attempts = 3) {
+  let lastErr;
+  for (let i = 0; i < attempts; i++) {
+    try {
+      return await fetchRssSourceOnce(source);
+    } catch (err) {
+      lastErr = err;
+      console.warn(`  ${source.name} attempt ${i + 1}/${attempts} failed: ${err.message}`);
+      if (i < attempts - 1) await sleep(1500 * (i + 1)); // 1.5s, then 3s
     }
-    lastFetch = Date.now();
-    console.log(`Loaded ${cachedReports.length} total reports`);
-  } catch (err) {
-    console.error('Fetch error:', err.message);
   }
+  throw lastErr;
+}
+
+async function fetchReports() {
+  console.log('Fetching reports from all sources...');
+  const results = await Promise.allSettled(SOURCES.map(source => fetchRssSource(source)));
+
+  const merged = new Map(); // de-dupe by report URL (a report can appear in both a ward feed and the fallback feed)
+  results.forEach((r, i) => {
+    const name = SOURCES[i].name;
+    if (r.status === 'fulfilled') {
+      sourceCache[name] = r.value;
+      console.log(`  ${name}: ${r.value.length} reports`);
+    } else {
+      console.error(`  ${name} failed after retries: ${r.reason && r.reason.message} — using last known data (${(sourceCache[name] || []).length} reports)`);
+    }
+    (sourceCache[name] || []).forEach(item => merged.set(item.id, item));
+  });
+
+  cachedReports = Array.from(merged.values()).sort((a, b) => b.ts - a.ts);
+  lastFetch = Date.now();
+  console.log(`Loaded ${cachedReports.length} total reports`);
 }
 
 // Fetch on start + every 12 minutes
